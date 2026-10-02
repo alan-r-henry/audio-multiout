@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+# Build output and the extracted Windows SDK tools used to package it --
+# large third-party binaries, rebuilt locally, never kept in git.
+build/
+dist/
+build-tools/
+*.log
