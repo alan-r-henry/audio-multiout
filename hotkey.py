@@ -10,6 +10,10 @@ import ctypes
 import threading
 from ctypes import wintypes
 
+import applog
+
+log = applog.get("hotkey")
+
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
@@ -62,7 +66,7 @@ class HotkeyListener(threading.Thread):
                     try:
                         self.callback()
                     except Exception:  # a UI error must not kill the listener
-                        pass
+                        log.exception("hotkey callback failed")
         finally:
             _user32.UnregisterHotKey(None, HOTKEY_ID)
 

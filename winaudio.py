@@ -11,6 +11,7 @@ guarded and failure is reported to the caller rather than raised.
 """
 
 import ctypes
+import math
 from ctypes import POINTER, Structure, Union, c_ulonglong, c_ushort, c_wchar_p
 from ctypes.wintypes import DWORD, LPCWSTR, UINT
 
@@ -178,7 +179,7 @@ class IPolicyConfig(IUnknown):
 
 
 class IAudioEndpointVolume(IUnknown):
-    """Only the master (all-channel) scalar volume is used here.
+    """Master (all-channel) scalar volume and mute.
 
     Every method ahead of the ones we call must still be declared, in COM
     vtable order, or the slot offset is wrong -- same trick as IPolicyConfig
@@ -203,7 +204,71 @@ class IAudioEndpointVolume(IUnknown):
                   (["out"], POINTER(ctypes.c_float), "pfLevelDB")),
         COMMETHOD([], comtypes.HRESULT, "GetMasterVolumeLevelScalar",
                   (["out"], POINTER(ctypes.c_float), "pfLevel")),
+        COMMETHOD([], comtypes.HRESULT, "SetChannelVolumeLevel",
+                  (["in"], UINT, "nChannel"), (["in"], ctypes.c_float, "fLevelDB"),
+                  (["in"], POINTER(GUID), "pguidEventContext")),
+        COMMETHOD([], comtypes.HRESULT, "SetChannelVolumeLevelScalar",
+                  (["in"], UINT, "nChannel"), (["in"], ctypes.c_float, "fLevel"),
+                  (["in"], POINTER(GUID), "pguidEventContext")),
+        COMMETHOD([], comtypes.HRESULT, "GetChannelVolumeLevel",
+                  (["in"], UINT, "nChannel"),
+                  (["out"], POINTER(ctypes.c_float), "pfLevelDB")),
+        COMMETHOD([], comtypes.HRESULT, "GetChannelVolumeLevelScalar",
+                  (["in"], UINT, "nChannel"),
+                  (["out"], POINTER(ctypes.c_float), "pfLevel")),
+        COMMETHOD([], comtypes.HRESULT, "SetMute",
+                  (["in"], ctypes.c_int, "bMute"),
+                  (["in"], POINTER(GUID), "pguidEventContext")),
+        COMMETHOD([], comtypes.HRESULT, "GetMute",
+                  (["out"], POINTER(ctypes.c_int), "pbMute")),
     ]
+
+
+class IAudioMeterInformation(IUnknown):
+    """Only GetPeakValue is used: the peak of what the mixer is sending to
+    this endpoint right now, 0.0-1.0, post-volume. If this moves while the
+    speakers are silent, the PC side is fine and the fault is downstream."""
+
+    _iid_ = GUID("{C02216F6-8C67-4B5B-9D00-D008E73E0064}")
+    _methods_ = [
+        COMMETHOD([], comtypes.HRESULT, "GetPeakValue",
+                  (["out"], POINTER(ctypes.c_float), "pfPeak")),
+    ]
+
+
+class PeakMeter:
+    """Holds an endpoint's meter open so it can be polled cheaply."""
+
+    def __init__(self, device_id):
+        self._meter = None
+        try:
+            device = _enumerator().GetDevice(device_id)
+            raw = device.Activate(IAudioMeterInformation._iid_,
+                                  comtypes.CLSCTX_ALL, None)
+            self._meter = raw.QueryInterface(IAudioMeterInformation)
+        except (OSError, comtypes.COMError):
+            pass
+
+    def peak(self):
+        """Current peak 0.0-1.0, or None if the endpoint has no meter."""
+        if self._meter is None:
+            return None
+        try:
+            return float(self._meter.GetPeakValue())
+        except (OSError, comtypes.COMError):
+            self._meter = None  # device went away; stop polling it
+            return None
+
+
+def peak_to_fraction(peak, floor_db=-60.0):
+    """Map a linear peak to a 0-1 meter fill on a dB scale.
+
+    Linear would leave ordinary listening levels looking almost empty.
+    """
+    if peak is None or peak <= 0.0:
+        return 0.0
+    db = 20.0 * math.log10(peak)
+    return max(0.0, min(1.0, (db - floor_db) / -floor_db))
 
 
 class Endpoint:
@@ -310,6 +375,23 @@ def set_volume(device_id, level):
         return True, "volume set"
     except (OSError, comtypes.COMError) as exc:
         return False, f"could not set volume: {exc}"
+
+
+def get_mute(device_id):
+    """True/False for the endpoint's mute switch, or None if unavailable."""
+    try:
+        return bool(_endpoint_volume(device_id).GetMute())
+    except (OSError, comtypes.COMError):
+        return None
+
+
+def set_mute(device_id, muted):
+    """Mute or unmute one endpoint. Returns (ok, note)."""
+    try:
+        _endpoint_volume(device_id).SetMute(1 if muted else 0, None)
+        return True, "muted" if muted else "unmuted"
+    except (OSError, comtypes.COMError) as exc:
+        return False, f"could not change mute: {exc}"
 
 
 def current_default():

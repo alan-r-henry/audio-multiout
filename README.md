@@ -81,7 +81,31 @@ devices you want; changes apply immediately.
   capture runs at all.
 - The **ms** box adds delay to a mirror. The live figure beside it is that
   mirror's current offset behind the primary.
-- Tray menu has **Stop mirroring** to drop back to single-device output.
+- Click a device's `MIR` tag to make it the primary without re-checking.
+- **Vol** slider is Windows' own per-device volume (follows changes made
+  elsewhere); click the **Vol** caption to mute that device. Mouse wheel nudges
+  any slider; double-click **Boost** to reset it to 100%.
+- **Boost** (mirrors only, up to 300%) is digital gain with a soft-knee limiter,
+  so loud peaks are squashed rather than chopped. The percentage turns amber
+  while the limiter is working -- more boost past that point only adds
+  distortion.
+- The thin bar under each device is a **live level meter** of what Windows is
+  sending to that endpoint. **Test** plays a short tone to one device and says
+  whether the PC delivered it -- the quick way to tell "PC sent audio" from "the
+  monitor/cable swallowed it" (for a monitor that goes silent, unplug its power
+  cable for 30s).
+- Tray menu: **Devices** (check/uncheck outputs without opening the panel),
+  **Stop mirroring**, **Start with Windows**.
+
+### Self-healing
+
+Every few seconds the app checks that routing is still what you asked for. If a
+selected device is unplugged or plugged back in, or a stream dies, it re-applies
+automatically (backing off if the device is genuinely gone). Windows renumbers
+endpoint ids on driver/OS updates; the app remembers each device's name and
+re-attaches your selection, delays and boosts to the same device afterwards.
+In boost-all mode, stopping or quitting hands the Windows default back to your
+first checked device instead of leaving it on the silent anchor.
 
 ## What this cannot do
 
@@ -108,13 +132,19 @@ Other limits:
 
 | File | Does |
 |---|---|
-| `main.py` | Tray icon, hotkey wiring, event pump, `--check` diagnostics |
-| `panel.py` | The popup, anchored above the tray |
-| `engine.py` | Turns a checked list into primary + mirrors |
-| `router.py` | Capture thread, per-mirror queues, drift correction |
+| `main.py` | Tray icon + menu, hotkey wiring, event pump, self-heal timer, `--check` |
+| `panel.py` | The popup: devices, volume/mute, boost, meters, test tone |
+| `engine.py` | Checked list -> primary + mirrors; id re-matching; recovery |
+| `router.py` | Capture thread, per-mirror queues, drift correction, boost limiter |
 | `wasapi.py` | `IAudioClient` / loopback capture / render, via ctypes COM |
-| `winaudio.py` | Core Audio enumeration + default-endpoint switching |
-| `config.py` | Settings in `%APPDATA%\audio-multiout\config.json` |
+| `winaudio.py` | Core Audio enumeration, default switching, volume/mute/meter |
+| `tone.py` | Test tone + "did the PC deliver it?" verdict |
+| `config.py` | Validated settings, atomic save, `%APPDATA%\audio-multiout\config.json` |
+| `applog.py` | Rotating log at `%APPDATA%\audio-multiout\app.log` |
+| `autostart.py` | Start-with-Windows (Run key / existing Startup shortcut) |
+| `hresult.py` | Plain-English reasons for COM errors |
+| `winui.py` | DPI awareness and work-area-aware popup placement |
+| `tests/` | Unit tests (`python -m unittest discover -s tests -t .`) |
 
 ## Notes
 
@@ -130,8 +160,22 @@ over. `restore_on_start` re-applies your last selection on launch; set it to
 
 ## Startup
 
-To start with Windows, put a shortcut to `run.cmd` in:
+Use the tray menu's **Start with Windows** (it also recognises an existing
+`Audio Multi-Out.lnk` in the Startup folder, and removes it when you turn the
+option off).
+
+## Troubleshooting
+
+Errors are logged to `%APPDATA%\audio-multiout\app.log` (the app runs without
+a console). `main.py --check` prints every device's volume, mute state and live
+level, whether your saved selection still resolves, and probes loopback.
+
+## Tests
 
 ```bash
-explorer shell:startup
+.venv\Scripts\python.exe -m unittest discover -s tests -t .
 ```
+
+Pure logic (gain/limiter, drift, config validation, id re-matching, recovery
+backoff, placement math) runs anywhere; a few tests touch the real audio stack
+and skip themselves if there is no output device.

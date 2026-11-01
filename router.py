@@ -18,8 +18,12 @@ import time
 import comtypes
 import numpy as np
 
+import applog
+import hresult
 import wasapi
 import winaudio
+
+log = applog.get("router")
 
 # How much audio to keep queued ahead on each mirror. Lower is tighter sync,
 # higher survives scheduling hiccups. 20ms is about the floor for Python.
@@ -37,6 +41,10 @@ DEPTH_SMOOTHING = 0.05
 
 SERVICE_INTERVAL = 0.004
 
+# An empty queue only counts as an underrun if the source delivered audio
+# this recently (seconds); otherwise the PC is simply silent.
+UNDERRUN_SOURCE_WINDOW = 0.1
+
 # Ceiling on digital boost. Windows' own volume APIs -- endpoint and session
 # alike -- top out at 100% by construction, so going past that means scaling
 # sample values ourselves rather than asking the OS for more. 3x (~+9.5dB) is
@@ -51,24 +59,61 @@ MAX_GAIN = 3.0
 _DTYPE_BY_BITS = {32: np.dtype("<f4"), 16: np.dtype("<i2")}
 
 
-def _apply_gain(data, gain, bits_per_sample):
-    """Scale raw PCM/float bytes by `gain`, hard-clipped to full scale.
+# Above this fraction of full scale the boosted signal is eased toward 1.0
+# rather than chopped off. Below it the gain is exactly linear.
+LIMITER_KNEE = 0.8
 
-    Hard clipping distorts anything that was already near full scale --
-    that is an inherent cost of boosting past unity digitally, not a bug.
+
+def _soft_limit(x):
+    """Linear up to the knee, then tanh-compressed so |y| < 1 approaches 1.0.
+
+    Value and slope are continuous at the knee (tanh'(0) == 1), so there is no
+    audible kink -- peaks get squashed instead of flat-topped, which sounds far
+    less harsh than hard clipping at the same gain.
+    """
+    magnitude = np.abs(x)
+    over = magnitude > LIMITER_KNEE
+    if not over.any():
+        return x, 0
+    out = x.copy()
+    head = 1.0 - LIMITER_KNEE
+    squashed = LIMITER_KNEE + head * np.tanh((magnitude[over] - LIMITER_KNEE) / head)
+    out[over] = np.copysign(squashed, x[over])
+    return out, int(over.sum())
+
+
+def _boost(data, gain, bits_per_sample):
+    """Scale raw PCM/float bytes by `gain`. Returns (bytes, samples_limited).
+
+    Boosting past unity digitally can only ever push peaks toward full scale;
+    the soft limiter keeps them from wrapping or hard-clipping. Attenuation
+    (gain < 1) cannot overload, so it skips the limiter.
     """
     if gain == 1.0 or not data:
-        return data
+        return data, 0
     dtype = _DTYPE_BY_BITS.get(bits_per_sample)
     if dtype is None:
-        return data
+        return data, 0
     samples = np.frombuffer(data, dtype=dtype)
     if dtype.kind == "f":
-        boosted = np.clip(samples.astype(np.float32) * gain, -1.0, 1.0)
-        return boosted.astype(dtype).tobytes()
-    peak = np.iinfo(dtype).max
-    boosted = np.clip(samples.astype(np.float32) * gain, -peak - 1, peak)
-    return boosted.astype(dtype).tobytes()
+        scaled = samples.astype(np.float32) * gain
+        limited = 0
+        if gain > 1.0:
+            scaled, limited = _soft_limit(scaled)
+        return np.clip(scaled, -1.0, 1.0).astype(dtype).tobytes(), limited
+
+    full_scale = float(np.iinfo(dtype).max)
+    scaled = samples.astype(np.float32) * (gain / full_scale)
+    limited = 0
+    if gain > 1.0:
+        scaled, limited = _soft_limit(scaled)
+    out = np.clip(scaled * full_scale, -full_scale - 1, full_scale)
+    return np.rint(out).astype(dtype).tobytes(), limited
+
+
+def _apply_gain(data, gain, bits_per_sample):
+    """Bytes-only convenience wrapper around _boost."""
+    return _boost(data, gain, bits_per_sample)[0]
 
 
 class Mirror:
@@ -91,6 +136,9 @@ class Mirror:
         self.underruns = 0
         self.dropped_frames = 0
         self.inserted_frames = 0
+        self.limited_samples = 0
+        self._last_limited = 0.0
+        self._last_fed = 0.0
         self._smoothed_depth = None
         self._last_correction = 0.0
 
@@ -122,10 +170,20 @@ class Mirror:
             self._smoothed_depth = float(written // self.frame_bytes)
         except Exception as exc:
             self.failed = f"{self.endpoint.name}: could not prime ({exc!r})"
+            log.warning(self.failed)
 
     def feed(self, data):
         if data and self.failed is None:
-            self.queue += _apply_gain(data, self.gain, self.bits_per_sample)
+            self._last_fed = time.monotonic()
+            boosted, limited = _boost(data, self.gain, self.bits_per_sample)
+            self.queue += boosted
+            if limited:
+                self.limited_samples += limited
+                self._last_limited = time.monotonic()
+
+    def limiting_now(self, window=1.0):
+        """True if the limiter engaged within the last `window` seconds."""
+        return time.monotonic() - self._last_limited < window
 
     def service(self):
         """Push queued audio out and correct drift. Returns False once dead."""
@@ -167,15 +225,20 @@ class Mirror:
                 if written:
                     del self.queue[:written]
             elif padding == 0:
-                # Nothing queued and the device has run dry.
+                # Nothing queued and the device has run dry. Keep it fed with
+                # silence either way, but only call it an underrun if the
+                # source was actually playing: a quiet PC delivers no packets
+                # at all, and that isn't a glitch.
                 self.renderer.write_silence(self._ms_to_frames(5))
-                self.underruns += 1
+                if now - self._last_fed < UNDERRUN_SOURCE_WINDOW:
+                    self.underruns += 1
             return True
         except Exception as exc:
             # Anything at all here means this mirror is done. Catching broadly
             # keeps one bad endpoint (or one bug) from taking the others down
             # with it, and records why rather than dying silently.
-            self.failed = f"{self.endpoint.name}: stream lost ({exc!r})"
+            self.failed = f"{self.endpoint.name}: stream lost ({hresult.describe(exc)})"
+            log.warning(self.failed)
             return False
 
     def close(self):
@@ -218,6 +281,7 @@ class Router:
                 "offset_ms": m.offset_ms(),
                 "delay_ms": m.delay_ms,
                 "gain": m.gain,
+                "limiting": m.limiting_now(),
                 "corrections": m.corrections,
                 "underruns": m.underruns,
                 "dropped_frames": m.dropped_frames,
@@ -258,7 +322,9 @@ class Router:
             capture = wasapi.LoopbackCapture(source_device)
             fmt = capture.open()
         except (comtypes.COMError, OSError, StopIteration) as exc:
-            self.error = f"could not open loopback on {primary.name}: {exc}"
+            self.error = (f"could not open loopback on {primary.name}: "
+                          f"{hresult.describe(exc)}")
+            log.error(self.error)
             return False, self.error
 
         opened = []
@@ -277,11 +343,13 @@ class Router:
                 mirror.prime()
                 opened.append(mirror)
             except (comtypes.COMError, OSError) as exc:
-                problems.append(f"{endpoint.name}: {exc}")
+                problems.append(f"{endpoint.name}: {hresult.describe(exc)}")
+                log.warning("could not open mirror %s: %s", endpoint.name, exc)
 
         if not opened:
             capture.stop()
             self.error = "; ".join(problems) or "no mirror devices could be opened"
+            log.error(self.error)
             return False, self.error
 
         self.capture = capture
@@ -294,6 +362,8 @@ class Router:
                                        name="audio-router")
         self.thread.start()
 
+        log.info("started: %s -> %s (%s)", primary.name,
+                 [m.endpoint.name for m in opened], fmt.describe())
         message = f"mirroring {primary.name} to {len(opened)} device(s)"
         if problems:
             message += " | failed: " + "; ".join(problems)
@@ -309,6 +379,7 @@ class Router:
                     data = self.capture.read()
                 except Exception as exc:
                     self.error = f"capture stopped: {exc!r}"
+                    log.error(self.error)
                     break
 
                 with self.lock:
@@ -318,15 +389,22 @@ class Router:
                     if all(m.failed for m in self.mirrors):
                         self.error = ("all mirror streams were lost: "
                                       + "; ".join(m.failed for m in self.mirrors))
+                        log.error(self.error)
                         break
                 time.sleep(SERVICE_INTERVAL)
         except Exception as exc:
             self.error = f"router thread crashed: {exc!r}"
+            log.exception("router thread crashed")
         finally:
             wasapi.drop_thread_priority(priority)
             self._teardown()
 
     def _teardown(self):
+        for mirror in self.mirrors:
+            log.info("%s: %d corrections, %d underruns, dropped %d / inserted %d "
+                     "frames, limiter hit %d samples", mirror.endpoint.name,
+                     mirror.corrections, mirror.underruns, mirror.dropped_frames,
+                     mirror.inserted_frames, mirror.limited_samples)
         if self.capture is not None:
             self.capture.stop()
             self.capture = None
